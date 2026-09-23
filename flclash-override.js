@@ -14,7 +14,13 @@
 // ============================================================================
 
 function main(config) {
-  const BASE = "https://github.com/shihejun1/flclash-adblock/releases/download/ruleset";
+  // 说明：手机直连 github.com 在国内常常超时，mihomo 拉不到 .mrs 规则集就等于没启用。
+  // 所以这里用 GitHub 代理镜像下载（始终指向最新 Release，不缓存旧版本）。
+  // 若某天该镜像失效，把下面这行换成任一可用镜像即可（原始地址永久不变）：
+  //   https://gh-proxy.com/https://github.com/shihejun1/flclash-adblock/releases/download/ruleset
+  //   https://ghfast.top/https://github.com/shihejun1/flclash-adblock/releases/download/ruleset
+  //   https://ghproxy.net/https://github.com/shihejun1/flclash-adblock/releases/download/ruleset
+  const BASE = "https://gh-proxy.com/https://github.com/shihejun1/flclash-adblock/releases/download/ruleset";
 
   // 1) 注册规则集提供者（本地缓存见 path）
   config["rule-providers"] = config["rule-providers"] || {};
