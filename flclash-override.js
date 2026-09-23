@@ -14,7 +14,7 @@
 // ============================================================================
 
 function main(config) {
-  const BASE = "https://github.com/OWNER/REPO/releases/download/ruleset";
+  const BASE = "https://github.com/shihejun1/flclash-adblock/releases/download/ruleset";
 
   // 1) 注册规则集提供者（本地缓存见 path）
   config["rule-providers"] = config["rule-providers"] || {};
