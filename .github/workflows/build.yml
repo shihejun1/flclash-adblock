@@ -40,9 +40,8 @@ jobs:
           test -n "$URL" || { echo "找不到 mihomo amd64 资产"; exit 1; }
           echo "mihomo: $URL"
           curl -fsSL "$URL" -o mihomo.gz
-          gunzip -f mihomo.gz
-          chmod +x mihomo-linux-amd64-*
-          mv mihomo-linux-amd64-* mihomo
+          gunzip -f mihomo.gz     # 解出文件名即 mihomo
+          chmod +x mihomo
           ./mihomo -v
 
       - name: 构建合并规则集
