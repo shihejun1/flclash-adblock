@@ -39,8 +39,7 @@ jobs:
           test -n "$URL"
           curl -fsSL "$URL" -o mihomo.gz
           gunzip -f mihomo.gz
-          chmod +x mihomo-linux-amd64-*
-          mv mihomo-linux-amd64-* mihomo
+          chmod +x mihomo
           ./mihomo -v
 
       - name: 生成构建脚本并执行
