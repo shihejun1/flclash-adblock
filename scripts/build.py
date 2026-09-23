@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+把多个上游广告规则源合并、去重，并转成 mihomo 的 .mrs 规则集。
+
+产物:
+  dist/adblock.txt   纯域名列表（兜底 / 方便查看、比对、二次加工）
+  dist/adblock.mrs   mihomo rule-set，behavior=domain（二进制，加载快）
+
+设计要点:
+  * 只用标准库，GitHub Actions 和本机都能直接跑（不需要 jq）
+  * 失败安全(fail-closed)：合并后条目数异常偏少就直接报错退出，
+    绝不发布会覆盖你现有拦截的"空名单"
+  * 白名单：whitelist.txt 里列的域名会从结果中剔除，用于修正误杀
+  * 上游地址可被参数覆盖，方便某天源改名时快速切换
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+# ---------------------------------------------------------------- 默认上游
+
+# anti-AD：纯域名表，behavior=domain。官网地址作为第二兜底。
+DEFAULT_ANTIAD = [
+    "https://raw.githubusercontent.com/privacy-protection-tools/anti-AD/master/anti-ad-domains.txt",
+    "https://anti-ad.net/domains.txt",
+]
+
+# REIJI007：文件名叫 .txt，内容其实是 YAML payload（`- DOMAIN-SUFFIX,x`）。
+DEFAULT_REIJI = [
+    "https://raw.githubusercontent.com/REIJI007/AdBlock_Rule_For_Clash/main/adblock_reject.txt",
+    "https://raw.githubusercontent.com/REIJI007/AdBlock_Rule_For_Clash/main/adblock_reject.yaml",
+]
+
+UA = "Mozilla/5.0 (adblock-ruleset-builder)"
+
+# 合法域名：字母数字下划线连字符点。刻意不用域名正则硬校验，
+# 因为广告域名里偶尔有奇怪但真实存在的形式，宁可放过也别误杀。
+DOMAIN_RE = re.compile(r"^[A-Za-z0-9_]([A-Za-z0-9_\-.]*[A-Za-z0-9_])?$")
+
+# 匹配 REIJI007 的 payload 行：  - DOMAIN-SUFFIX,example.com
+#                              - DOMAIN,example.com
+RULE_LINE_RE = re.compile(r"^-\s*([A-Za-z0-9\-]+)\s*,\s*(\S+)\s*$")
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def fetch(urls: list[str], timeout: int = 60, retries: int = 3) -> str:
+    """依次尝试候选 URL，返回第一个成功的文本内容。"""
+    last_err: Exception | None = None
+    for url in urls:
+        for attempt in range(1, retries + 1):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = resp.read().decode("utf-8", errors="replace")
+                log(f"  [ok] {url}  ({len(data)} bytes)")
+                return data
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                log(f"  [retry {attempt}/{retries}] {url} -> {exc}")
+                time.sleep(2 * attempt)
+    raise RuntimeError(f"所有候选地址均失败: {urls} ; 最后错误: {last_err}")
+
+
+def is_ip(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def clean_domain(s: str) -> str | None:
+    """规范化单个域名；不合法返回 None。"""
+    s = s.strip().strip(".").lower()
+    if not s or "." not in s:
+        return None
+    if is_ip(s):
+        return None
+    if not DOMAIN_RE.match(s):
+        return None
+    return s
+
+
+def parse_plain(text: str) -> set[str]:
+    """解析纯域名表（anti-AD 那种），一行一个域名，# 开头是注释。"""
+    out: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("#", "!", ";")):
+            continue
+        # hosts 风格 "0.0.0.0 example.com" 也顺手兼容一下
+        parts = line.split()
+        if len(parts) >= 2 and (is_ip(parts[0]) or parts[0] == "0"):
+            line = parts[1]
+        elif len(parts) > 1:
+            line = parts[0]
+        d = clean_domain(line)
+        if d:
+            out.add(d)
+    return out
+
+
+def parse_reiji(text: str) -> tuple[set[str], dict[str, int]]:
+    """
+    解析 REIJI007 的 payload 格式。
+    DOMAIN / DOMAIN-SUFFIX 取域名；其它类型（KEYWORD/REGEX/IP）单独计数丢弃，
+    因为 domain 行为无法表达它们（上游目前也只有前两类）。
+    """
+    out: set[str] = set()
+    skipped: dict[str, int] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line == "payload:":
+            continue
+        m = RULE_LINE_RE.match(line)
+        if not m:
+            continue
+        kind, value = m.group(1).upper(), m.group(2)
+        if kind in ("DOMAIN", "DOMAIN-SUFFIX"):
+            d = clean_domain(value)
+            if d:
+                out.add(d)
+        else:
+            skipped[kind] = skipped.get(kind, 0) + 1
+    return out, skipped
+
+
+def load_whitelist(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    out: set[str] = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        d = clean_domain(line)
+        if d:
+            out.add(d)
+    return out
+
+
+def convert(mihomo: str, src: Path, dst: Path) -> None:
+    """调用 mihomo 内核把纯域名文本转成 .mrs。"""
+    cmd = [mihomo, "convert-ruleset", "domain", "text", str(src), str(dst)]
+    log(f"  $ {' '.join(cmd)}")
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"mihomo convert-ruleset 失败 (exit {proc.returncode})\n"
+            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+        )
+    if not dst.exists() or dst.stat().st_size == 0:
+        raise RuntimeError("mihomo 未生成有效的 .mrs 文件")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="构建合并版去广告 mrs 规则集")
+    ap.add_argument("--mihomo", default="./mihomo", help="mihomo 可执行文件路径")
+    ap.add_argument("--out-dir", default="dist", help="产物输出目录")
+    ap.add_argument("--whitelist", default="whitelist.txt", help="白名单文件")
+    ap.add_argument("--antiad-url", action="append", default=None,
+                    help="覆盖 anti-AD 地址，可重复")
+    ap.add_argument("--reiji-url", action="append", default=None,
+                    help="覆盖 REIJI007 地址，可重复")
+    ap.add_argument("--no-reiji", action="store_true", help="不合并 REIJI007，只用 anti-AD")
+    ap.add_argument("--min-entries", type=int, default=20000,
+                    help="安全阈值：条目少于此数则失败退出（防止源故障污染产物）")
+    ap.add_argument("--no-mrs", action="store_true", help="只产出 txt，不调用 mihomo")
+    ap.add_argument("--timeout", type=int, default=60)
+    args = ap.parse_args()
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    antiad_urls = args.antiad_url or DEFAULT_ANTIAD
+    reiji_urls = args.reiji_url or DEFAULT_REIJI
+
+    log("[1/5] 拉取 anti-AD ...")
+    antiad = parse_plain(fetch(antiad_urls, timeout=args.timeout))
+    log(f"      anti-AD 域名数: {len(antiad)}")
+
+    reiji: set[str] = set()
+    if not args.no_reiji:
+        log("[2/5] 拉取 REIJI007 ...")
+        reiji, skipped = parse_reiji(fetch(reiji_urls, timeout=args.timeout))
+        log(f"      REIJI007 域名数: {len(reiji)}  丢弃的非域名规则: {skipped or '无'}")
+    else:
+        log("[2/5] 跳过 REIJI007 (--no-reiji)")
+
+    log("[3/5] 合并去重 ...")
+    merged = antiad | reiji
+    before_wl = len(merged)
+    wl = load_whitelist(Path(args.whitelist))
+    if wl:
+        merged -= wl
+    log(f"      合并后: {len(merged)}  (白名单剔除 {before_wl - len(merged)} 条, 白名单共 {len(wl)} 条)")
+
+    if len(merged) < args.min_entries:
+        log(f"[FAIL] 条目数 {len(merged)} 低于安全阈值 {args.min_entries}，"
+            f"疑似上游故障，已中止以免覆盖现有规则。")
+        return 2
+
+    txt_path = out_dir / "adblock.txt"
+    log(f"[4/5] 写出 {txt_path} ...")
+    with txt_path.open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write("# 由 flclash-adblock 合并生成，勿手改\n")
+        fh.write(f"# 生成时间: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}\n")
+        fh.write(f"# 条目数: {len(merged)}\n")
+        for d in sorted(merged):
+            fh.write(d + "\n")
+
+    if args.no_mrs:
+        log("[5/5] 跳过 mrs 生成 (--no-mrs)")
+        return 0
+
+    mrs_path = out_dir / "adblock.mrs"
+    log(f"[5/5] 生成 {mrs_path} ...")
+    convert(args.mihomo, txt_path, mrs_path)
+    log(f"      完成: {mrs_path}  ({mrs_path.stat().st_size} bytes)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001
+        log(f"[ERROR] {exc}")
+        sys.exit(1)

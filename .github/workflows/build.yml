@@ -1,0 +1,70 @@
+name: Build adblock ruleset
+
+# 每 6 小时自动构建一次；也可以手动触发；改动脚本后推送也会触发。
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ruleset
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 下载 mihomo 内核（用于把文本转成 .mrs）
+        run: |
+          set -euo pipefail
+          URL=$(python3 - <<'PY'
+          import json, urllib.request
+          d = json.load(urllib.request.urlopen(
+              "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"))
+          for a in d["assets"]:
+              n = a["name"]
+              if (n.startswith("mihomo-linux-amd64-") and n.endswith(".gz")
+                      and "compatible" not in n and "go1" not in n):
+                  print(a["browser_download_url"])
+                  break
+          PY
+          )
+          test -n "$URL" || { echo "找不到 mihomo amd64 资产"; exit 1; }
+          echo "mihomo: $URL"
+          curl -fsSL "$URL" -o mihomo.gz
+          gunzip -f mihomo.gz
+          chmod +x mihomo-linux-amd64-*
+          mv mihomo-linux-amd64-* mihomo
+          ./mihomo -v
+
+      - name: 构建合并规则集
+        run: python3 scripts/build.py --mihomo ./mihomo --out-dir dist
+
+      - name: 发布 Release（固定 tag + 固定文件名 = 稳定 URL）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ruleset
+          name: adblock ruleset
+          body: |
+            自动构建的去广告规则集。
+            合并来源：anti-AD + REIJI007
+            产物：adblock.mrs（behavior=domain）、adblock.txt（兜底）
+          files: |
+            dist/adblock.mrs
+            dist/adblock.txt
+          make_latest: false
+
+      - name: 上传 artifact（保留 7 天，便于排查）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruleset
+          path: dist/
+          retention-days: 7
